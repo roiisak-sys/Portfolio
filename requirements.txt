@@ -1,0 +1,6 @@
+flask>=3.0,<4.0
+gunicorn>=22.0
+yfinance>=0.2.40
+pandas>=2.0
+psycopg[binary]>=3.2
+weasyprint>=62.0

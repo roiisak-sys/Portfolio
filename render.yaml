@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: portfolio-dashboard
+    env: python
+    plan: free
+    buildCommand: |
+      apt-get update && apt-get install -y libpango-1.0-0 libpangoft2-1.0-0 || true
+      pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 2
+    envVars:
+      - key: PORTFOLIO_PASSWORD
+        sync: false           # set in Render dashboard
+      - key: FLASK_SECRET_KEY
+        generateValue: true   # Render auto-generates a random value
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: EMAIL_TO
+        sync: false
+      - key: CRON_SECRET
+        generateValue: true
+      - key: DEFAULT_DISPLAY_CCY
+        value: ILS
+      - key: DATABASE_URL
+        fromDatabase:
+          name: portfolio-db
+          property: connectionString
+
+databases:
+  - name: portfolio-db
+    plan: free
