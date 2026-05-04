@@ -1181,7 +1181,7 @@ Then end with:
     try:
         import urllib.request as _req
         body = json.dumps({
-            "model": "claude-sonnet-4-20250514",
+            "model": "claude-sonnet-4-5",
             "max_tokens": 8000,
             "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             "messages": [{"role": "user", "content": prompt}],
@@ -1192,7 +1192,6 @@ Then end with:
             headers={
                 "x-api-key": ANTHROPIC_API_KEY,
                 "anthropic-version": "2023-06-01",
-                "anthropic-beta": "interleaved-thinking-2025-05-14",
                 "content-type": "application/json",
             },
             method="POST",
@@ -1215,7 +1214,17 @@ Then end with:
         return jsonify({"ok": True, "result": analysis_text, "cached": False})
 
     except Exception as e:
-        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
+        # Try to extract the actual error message from the API response
+        import urllib.error as _uerr
+        if isinstance(e, _uerr.HTTPError):
+            try:
+                err_body = json.loads(e.read().decode())
+                err_msg = err_body.get("error", {}).get("message", str(e))
+            except Exception:
+                err_msg = str(e)
+        else:
+            err_msg = str(e)
+        return jsonify({"error": f"Analysis failed: {err_msg}"}), 500
 
 
 @app.route("/api/send-report", methods=["POST"])
