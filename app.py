@@ -74,6 +74,14 @@ DEFAULT_DISPLAY_CCY = os.environ.get("DEFAULT_DISPLAY_CCY", "ILS").strip().upper
 # /tasks/send-report?key=... without exposing the email-sending power to anyone.
 CRON_SECRET = os.environ.get("CRON_SECRET", "").strip()
 
+# Anthropic API — for the analyst research widget
+# Set ANTHROPIC_API_KEY in your environment / Render env vars.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+
+# Cache for analyst reports (expensive to generate — cache for 6 hours)
+ANALYSIS_CACHE: dict[str, tuple[float, str]] = {}
+ANALYSIS_CACHE_TTL = 6 * 3600
+
 # Cache prices in memory between refreshes (per-ticker, 60-second TTL)
 # Keeps clicking "Refresh" repeatedly from hammering Yahoo.
 PRICE_CACHE: dict[str, tuple[float, dict]] = {}
@@ -1060,6 +1068,156 @@ def api_health():
     return jsonify({"ok": True})
 
 
+@app.route("/api/analyze", methods=["POST"])
+def api_analyze():
+    """Run analyst research on the active portfolio using Claude + web search."""
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"error": "ANTHROPIC_API_KEY not configured. Add it to your environment variables."}), 503
+
+    data = request.get_json() or {}
+    horizon  = data.get("horizon", "Long-term (3–5 years)")
+    risk     = data.get("risk", "Moderate")
+    force    = data.get("force", False)
+
+    # Build portfolio snapshot from current positions
+    store   = load_store()
+    active  = store["active"]
+    txs     = store["portfolios"].get(active, {}).get("transactions", [])
+    positions = compute_positions(txs)
+    open_pos  = [p for p in positions.values() if p["quantity"] > 0]
+
+    if not open_pos:
+        return jsonify({"error": "No open positions to analyze."}), 400
+
+    portfolio_json = json.dumps([
+        {
+            "ticker":   p["ticker"],
+            "quantity": round(p["quantity"], 4),
+            "avg_cost": round(p["avg_cost"], 4),
+            "currency": p["currency"],
+        }
+        for p in open_pos
+    ], indent=2)
+
+    # Cache key based on tickers + quantities (not prices)
+    cache_key = f"{active}|{portfolio_json}|{horizon}|{risk}"
+    if not force and cache_key in ANALYSIS_CACHE:
+        ts, cached = ANALYSIS_CACHE[cache_key]
+        if time.time() - ts < ANALYSIS_CACHE_TTL:
+            return jsonify({"ok": True, "result": cached, "cached": True})
+
+    prompt = f"""You are a professional equity research assistant.
+Your task is to analyze a user's stock portfolio and produce evidence-based recommendations using analyst consensus and fundamental data.
+
+You must follow these rules strictly:
+1. Do NOT fabricate analyst ratings or sources.
+2. If data is missing, explicitly say "Data not available".
+3. Prefer data from the last 90 days. Ignore data older than 180 days unless necessary.
+4. Be concise, structured, and analytical — not promotional.
+5. Separate facts from interpretation clearly.
+6. When sources disagree, reflect that uncertainty in your scoring.
+7. If fewer than 5 credible sources are found, reduce confidence level.
+You optimize for long-term investing unless explicitly told otherwise.
+
+Analyze the following portfolio:
+{portfolio_json}
+
+Investment horizon: {horizon}
+Risk tolerance: {risk}
+
+For EACH stock:
+
+STEP 1 — Analyst Sentiment Collection
+Use web search to collect current ratings from as many of the following as possible:
+Morningstar, Zacks, TipRanks, Seeking Alpha, MarketBeat, Yahoo Finance consensus, MarketWatch, Benzinga, CFRA, Barron's.
+Return ONLY verified sources. No guessing.
+
+STEP 2 — Normalize Ratings
+Convert to score: Strong Buy=+2, Buy=+1, Hold=0, Sell=-1, Strong Sell=-2
+Compute: Average score, Bullish / Neutral / Bearish percentages
+
+STEP 3 — Fundamentals Snapshot
+Include: Current price, Forward P/E, Revenue growth, EPS growth, Analyst price target and implied upside
+
+STEP 4 — Risk Flags
+Identify: Earnings within 30 days, Recent downgrades, High valuation vs historical, Negative estimate revisions
+
+STEP 5 — Recommendation
+Give ONE: Strong Buy / Buy / Hold / Reduce / Sell
+Base it on: Weighted analyst consensus + Fundamentals + User risk profile
+
+OUTPUT FORMAT (STRICT — use markdown):
+
+## [TICKER]
+**Score:** X.X
+**Sentiment:** Bull X% / Neutral X% / Bear X%
+**Price Target Upside:** X%
+
+**Sources:**
+- Source — Rating
+
+**Risks:**
+- bullet points
+
+**Recommendation:** XXX
+
+**Reasoning:**
+3–5 sentences max, no fluff.
+
+---
+
+Then end with:
+
+## PORTFOLIO SUMMARY
+- **Best position:** ...
+- **Weakest position:** ...
+- **Concentration risks:** ...
+- **Actions (max 3):**
+  1. ...
+  2. ...
+  3. ...
+"""
+
+    try:
+        import urllib.request as _req
+        body = json.dumps({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 8000,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [{"role": "user", "content": prompt}],
+        }).encode()
+        req = _req.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=body,
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": "interleaved-thinking-2025-05-14",
+                "content-type": "application/json",
+            },
+            method="POST",
+        )
+        resp = _req.urlopen(req, timeout=120)
+        result = json.loads(resp.read())
+
+        # Extract text blocks only
+        text_parts = [
+            block["text"]
+            for block in result.get("content", [])
+            if block.get("type") == "text"
+        ]
+        analysis_text = "\n".join(text_parts).strip()
+
+        if not analysis_text:
+            return jsonify({"error": "No analysis returned from API."}), 500
+
+        ANALYSIS_CACHE[cache_key] = (time.time(), analysis_text)
+        return jsonify({"ok": True, "result": analysis_text, "cached": False})
+
+    except Exception as e:
+        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
+
+
 @app.route("/api/send-report", methods=["POST"])
 def api_send_report():
     """Manual trigger from the UI. Requires login (handled by before_request)."""
@@ -1473,7 +1631,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   }
   @keyframes spin { to { transform: rotate(360deg); } }
 
-  /* Page-level tabs (Dashboard / Transactions) */
+  /* Page-level tabs (Dashboard / Transactions / Analysis) */
   .page-tabs {
     display: flex;
     gap: 0;
@@ -1497,6 +1655,62 @@ INDEX_HTML = r"""<!DOCTYPE html>
     border-bottom-color: var(--accent);
   }
   .page-tab:hover { color: var(--ink); }
+
+  /* Analysis controls */
+  .analysis-controls {
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+
+  /* Analysis markdown output */
+  .analysis-output {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 28px 32px;
+    line-height: 1.7;
+  }
+  .analysis-output h2 {
+    font-family: 'Bodoni 72', 'Didot', 'Playfair Display', 'Georgia', serif;
+    font-size: 22px;
+    font-weight: 400;
+    margin: 28px 0 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--line);
+    color: var(--accent);
+  }
+  .analysis-output h2:first-child { margin-top: 0; }
+  .analysis-output h3 {
+    font-size: 14px;
+    font-family: 'Helvetica Neue', sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--muted);
+    margin: 16px 0 6px;
+    font-weight: 600;
+  }
+  .analysis-output p { margin: 6px 0 12px; }
+  .analysis-output ul { margin: 4px 0 12px 20px; }
+  .analysis-output li { margin: 3px 0; }
+  .analysis-output strong { color: var(--ink); }
+  .analysis-output hr {
+    border: none;
+    border-top: 1px solid var(--line);
+    margin: 24px 0;
+  }
+  .analysis-output code {
+    background: var(--paper-2);
+    padding: 1px 5px;
+    border-radius: 2px;
+    font-size: 12px;
+  }
+  /* Recommendation highlight */
+  .rec-buy       { color: var(--pos); font-weight: 700; }
+  .rec-sell      { color: var(--neg); font-weight: 700; }
+  .rec-hold      { color: var(--accent); font-weight: 700; }
 
   /* Transaction form */
   .tx-form {
@@ -1551,6 +1765,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <div class="page-tabs">
   <div class="page-tab active" data-tab="dashboard">Dashboard</div>
   <div class="page-tab" data-tab="transactions">Transactions</div>
+  <div class="page-tab" data-tab="analysis">📊 Analysis</div>
 </div>
 
 <!-- ===================== DASHBOARD TAB ===================== -->
@@ -1663,6 +1878,45 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </section>
 
 </div><!-- /tab-transactions -->
+
+<!-- ===================== ANALYSIS TAB ===================== -->
+<div id="tab-analysis" style="display:none;">
+
+<section>
+  <h2>Analyst Research</h2>
+  <div class="analysis-controls">
+    <div class="field">
+      <label>Investment Horizon</label>
+      <select id="an-horizon">
+        <option value="Short-term (under 1 year)">Short-term (&lt;1 year)</option>
+        <option value="Medium-term (1–3 years)">Medium-term (1–3 years)</option>
+        <option value="Long-term (3–5 years)" selected>Long-term (3–5 years)</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Risk Tolerance</label>
+      <select id="an-risk">
+        <option value="Conservative">Conservative</option>
+        <option value="Moderate" selected>Moderate</option>
+        <option value="Aggressive">Aggressive</option>
+      </select>
+    </div>
+    <button id="an-run">Run Analysis</button>
+    <button id="an-force" class="ghost" title="Bypass 6-hour cache and re-fetch">Force refresh</button>
+  </div>
+  <div class="notice" id="an-no-key" style="display:none;">
+    <b>ANTHROPIC_API_KEY not set.</b> Add it to your environment variables to enable analyst research.
+    <br><span style="font-size:12px;">Set it in Render's Environment tab, or locally: <code>set ANTHROPIC_API_KEY=sk-ant-...</code></span>
+  </div>
+  <div id="an-status" style="color:var(--muted); font-size:13px; font-style:italic; margin:16px 0;"></div>
+</section>
+
+<section id="an-result-section" style="display:none;">
+  <div id="an-result" class="analysis-output"></div>
+  <div style="color:var(--muted); font-size:11px; margin-top:12px; font-style:italic;" id="an-cache-note"></div>
+</section>
+
+</div><!-- /tab-analysis -->
 
 <footer>
   Data: Yahoo Finance (yfinance) · Holdings stored in <code>portfolio.json</code> on your machine.<br>
@@ -2322,12 +2576,114 @@ document.querySelectorAll('.page-tab').forEach(tab => {
     document.querySelectorAll('.page-tab').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
     state.activeTab = tab.dataset.tab;
-    document.getElementById('tab-dashboard').style.display =
-      state.activeTab === 'dashboard' ? '' : 'none';
-    document.getElementById('tab-transactions').style.display =
-      state.activeTab === 'transactions' ? '' : 'none';
+    document.getElementById('tab-dashboard').style.display    = state.activeTab === 'dashboard'    ? '' : 'none';
+    document.getElementById('tab-transactions').style.display = state.activeTab === 'transactions' ? '' : 'none';
+    document.getElementById('tab-analysis').style.display     = state.activeTab === 'analysis'     ? '' : 'none';
   });
 });
+
+// ============================================================================
+// ANALYSIS TAB
+// ============================================================================
+
+// Simple markdown→HTML renderer (no external lib needed)
+function markdownToHtml(md) {
+  return md
+    // HR
+    .replace(/^---$/gm, '<hr>')
+    // H2
+    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+    // H3
+    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+    // Bold
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    // Bullet points
+    .replace(/^[\*\-] (.+)$/gm, '<li>$1</li>')
+    .replace(/(<li>.*<\/li>\n?)+/gs, m => '<ul>' + m + '</ul>')
+    // Numbered lists
+    .replace(/^\d+\. (.+)$/gm, '<li>$1</li>')
+    // Inline code
+    .replace(/`(.+?)`/g, '<code>$1</code>')
+    // Paragraphs (lines that aren't already tags)
+    .replace(/^(?!<[hul]|<li|<hr|<code)(.+)$/gm, '<p>$1</p>')
+    // Color recommendation keywords
+    .replace(/<strong>Recommendation:<\/strong> (Strong Buy|Buy)/g,
+      '<strong>Recommendation:</strong> <span class="rec-buy">$1</span>')
+    .replace(/<strong>Recommendation:<\/strong> (Strong Sell|Sell|Reduce)/g,
+      '<strong>Recommendation:</strong> <span class="rec-sell">$1</span>')
+    .replace(/<strong>Recommendation:<\/strong> (Hold)/g,
+      '<strong>Recommendation:</strong> <span class="rec-hold">$1</span>');
+}
+
+async function runAnalysis(force = false) {
+  const runBtn   = document.getElementById('an-run');
+  const forceBtn = document.getElementById('an-force');
+  const status   = document.getElementById('an-status');
+  const resultSection = document.getElementById('an-result-section');
+  const resultEl = document.getElementById('an-result');
+  const cacheNote = document.getElementById('an-cache-note');
+  const noKeyEl  = document.getElementById('an-no-key');
+
+  runBtn.disabled   = true;
+  forceBtn.disabled = true;
+  noKeyEl.style.display = 'none';
+  resultSection.style.display = 'none';
+
+  const horizon = document.getElementById('an-horizon').value;
+  const risk    = document.getElementById('an-risk').value;
+
+  const steps = [
+    'Gathering analyst ratings from web sources...',
+    'Collecting fundamentals data...',
+    'Normalizing ratings and computing scores...',
+    'Assessing risk flags...',
+    'Building recommendations...',
+  ];
+  let stepIdx = 0;
+  status.textContent = steps[0];
+  const stepTimer = setInterval(() => {
+    stepIdx = (stepIdx + 1) % steps.length;
+    status.textContent = steps[stepIdx];
+  }, 4000);
+
+  try {
+    const r = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ horizon, risk, force }),
+    });
+    const data = await r.json();
+    clearInterval(stepTimer);
+
+    if (!data.ok) {
+      status.textContent = '';
+      if (data.error && data.error.includes('ANTHROPIC_API_KEY')) {
+        noKeyEl.style.display = 'block';
+      } else {
+        status.textContent = `Error: ${data.error || 'Unknown error'}`;
+        status.style.color = 'var(--neg)';
+      }
+      return;
+    }
+
+    status.textContent = '';
+    resultEl.innerHTML = markdownToHtml(data.result);
+    cacheNote.textContent = data.cached
+      ? 'Showing cached results (up to 6 hours old). Click "Force refresh" for fresh data.'
+      : `Analysis generated ${new Date().toLocaleString()} · Results cached for 6 hours`;
+    resultSection.style.display = '';
+  } catch(e) {
+    clearInterval(stepTimer);
+    status.textContent = `Request failed: ${e.message}`;
+    status.style.color = 'var(--neg)';
+  } finally {
+    runBtn.disabled   = false;
+    forceBtn.disabled = false;
+  }
+}
+
+document.getElementById('an-run').addEventListener('click', () => runAnalysis(false));
+document.getElementById('an-force').addEventListener('click', () => runAnalysis(true));
 
 // Chart period tabs
 document.querySelectorAll('.tab').forEach(tab => {
@@ -2378,6 +2734,10 @@ def main():
         print(f"  Email reports:    off (set SMTP_USER/SMTP_PASS to enable)")
     if CRON_SECRET:
         print(f"  Cron endpoint:    /tasks/send-report?key=<secret>")
+    if ANTHROPIC_API_KEY:
+        print(f"  Analyst research:  ON (Anthropic API key set)")
+    else:
+        print(f"  Analyst research:  off (set ANTHROPIC_API_KEY to enable)")
     if HOST == "0.0.0.0":
         print(f"  ⚠ Listening on ALL interfaces — use only behind a proxy/firewall")
     print(f"  Stop the server:  Ctrl+C")
