@@ -20,6 +20,8 @@ services:
         sync: false
       - key: CRON_SECRET
         generateValue: true
+      - key: ANTHROPIC_API_KEY
+        sync: false           # set in Render dashboard
       - key: DEFAULT_DISPLAY_CCY
         value: ILS
       - key: DATABASE_URL
