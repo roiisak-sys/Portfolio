@@ -83,44 +83,109 @@ CACHE_TTL_SECONDS = 60
 # ============================================================================
 # PORTFOLIO STORAGE
 # ============================================================================
-# File schema (v2):
+# ============================================================================
+# STORAGE — v3 Transaction Ledger
+# ============================================================================
+#
+# Schema v3:
 #   {
+#     "version": 3,
+#     "active": "Main",
 #     "portfolios": {
-#         "Main":      [ {ticker, quantity, avg_price, currency}, ... ],
-#         "Long-term": [ ... ],
-#     },
-#     "active": "Main"
+#       "Main": {
+#         "transactions": [
+#           {"id": "uuid", "action": "BUY"|"SELL", "ticker": "NVDA",
+#            "quantity": 10, "price": 13.43, "currency": "USD", "note": ""},
+#           ...
+#         ]
+#       }
+#     }
 #   }
 #
-# Auto-migrates from v1 (which was a flat list of holdings).
+# Migration path:
+#   v1 (flat list of holdings)  → v3  (each holding becomes one BUY tx)
+#   v2 (dict of holding lists)  → v3  (each holding becomes one BUY tx)
 #
-# Storage backend is auto-selected:
-#   - DATABASE_URL env var set → Postgres (production / Render)
-#   - Otherwise                → JSON file at PORTFOLIO_FILE (local dev)
+# Storage backend auto-selected:
+#   DATABASE_URL set  → Postgres
+#   Otherwise         → JSON file (PORTFOLIO_FILE)
 
 DEFAULT_PORTFOLIO_NAME = "Main"
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 
+def _new_id() -> str:
+    return secrets.token_hex(8)
+
+
 def _store_default() -> dict:
-    return {"portfolios": {DEFAULT_PORTFOLIO_NAME: []}, "active": DEFAULT_PORTFOLIO_NAME}
+    return {
+        "version": 3,
+        "active": DEFAULT_PORTFOLIO_NAME,
+        "portfolios": {DEFAULT_PORTFOLIO_NAME: {"transactions": []}},
+    }
+
+
+def _migrate_to_v3(raw) -> dict:
+    """Migrate v1 (list) or v2 (dict of lists) to v3 (transaction ledger)."""
+    store = _store_default()
+
+    # v1: flat list of holdings
+    if isinstance(raw, list):
+        txs = []
+        for h in raw:
+            if h.get("quantity", 0) > 0:
+                txs.append({
+                    "id": _new_id(),
+                    "action": "BUY",
+                    "ticker": h["ticker"].upper(),
+                    "quantity": float(h["quantity"]),
+                    "price": float(h["avg_price"]),
+                    "currency": h.get("currency", "USD"),
+                    "note": "Imported from legacy data",
+                })
+        store["portfolios"][DEFAULT_PORTFOLIO_NAME]["transactions"] = txs
+        return store
+
+    # v2: dict with "portfolios" key containing lists of holdings
+    if isinstance(raw, dict) and raw.get("version", 2) < 3:
+        portfolios = raw.get("portfolios", {})
+        active = raw.get("active", DEFAULT_PORTFOLIO_NAME)
+        for pname, holdings in portfolios.items():
+            txs = []
+            for h in (holdings if isinstance(holdings, list) else []):
+                if h.get("quantity", 0) > 0:
+                    txs.append({
+                        "id": _new_id(),
+                        "action": "BUY",
+                        "ticker": h["ticker"].upper(),
+                        "quantity": float(h["quantity"]),
+                        "price": float(h["avg_price"]),
+                        "currency": h.get("currency", "USD"),
+                        "note": "Imported from legacy data",
+                    })
+            store["portfolios"][pname] = {"transactions": txs}
+        store["active"] = active if active in store["portfolios"] else DEFAULT_PORTFOLIO_NAME
+        return store
+
+    return store
 
 
 def _normalize_store(raw) -> dict:
-    """Accept v1 (list) or v2 (dict) and return a clean v2 dict."""
-    # v1 → v2 migration
-    if isinstance(raw, list):
-        return {"portfolios": {DEFAULT_PORTFOLIO_NAME: raw}, "active": DEFAULT_PORTFOLIO_NAME}
-    if not isinstance(raw, dict) or "portfolios" not in raw:
+    """Ensure the store is valid v3. Migrates older schemas automatically."""
+    if not isinstance(raw, dict):
         return _store_default()
-    if not raw["portfolios"]:
-        raw["portfolios"] = {DEFAULT_PORTFOLIO_NAME: []}
+    if raw.get("version", 1) < 3:
+        return _migrate_to_v3(raw)
+    # v3 sanity checks
+    if "portfolios" not in raw or not raw["portfolios"]:
+        raw["portfolios"] = {DEFAULT_PORTFOLIO_NAME: {"transactions": []}}
     if raw.get("active") not in raw["portfolios"]:
         raw["active"] = next(iter(raw["portfolios"]))
     return raw
 
 
-# ---- JSON-file backend -----------------------------------------------------
+# ---- JSON backend ----------------------------------------------------------
 def _load_json() -> dict:
     if not PORTFOLIO_FILE.exists():
         return _store_default()
@@ -130,9 +195,9 @@ def _load_json() -> dict:
         print(f"Warning: could not read {PORTFOLIO_FILE}: {e}")
         return _store_default()
     store = _normalize_store(raw)
-    # If we migrated from v1, save v2 immediately
-    if isinstance(raw, list):
+    if raw.get("version", 1) < 3:
         _save_json(store)
+        print("  Migrated portfolio data to v3 (transaction ledger).")
     return store
 
 
@@ -146,13 +211,11 @@ def _save_json(store: dict) -> None:
 # ---- Postgres backend ------------------------------------------------------
 def _pg_conn():
     import psycopg
-    # Render provides URLs starting with "postgres://"; psycopg wants "postgresql://"
     url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
     return psycopg.connect(url, autocommit=True)
 
 
 def _pg_init():
-    """Create the kv table if missing."""
     with _pg_conn() as conn, conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS portfolio_store (
@@ -170,7 +233,11 @@ def _load_pg() -> dict:
         row = cur.fetchone()
         if not row:
             return _store_default()
-        return _normalize_store(row[0])
+        store = _normalize_store(row[0])
+        if row[0].get("version", 1) < 3:
+            _save_pg(store)
+            print("  Migrated Postgres data to v3.")
+        return store
 
 
 def _save_pg(store: dict) -> None:
@@ -184,9 +251,7 @@ def _save_pg(store: dict) -> None:
 
 # ---- Public storage API ----------------------------------------------------
 def load_store() -> dict:
-    if DATABASE_URL:
-        return _load_pg()
-    return _load_json()
+    return _load_pg() if DATABASE_URL else _load_json()
 
 
 def save_store(store: dict) -> None:
@@ -196,11 +261,96 @@ def save_store(store: dict) -> None:
         _save_json(store)
 
 
+def get_transactions(portfolio_name: str) -> list[dict]:
+    store = load_store()
+    return store["portfolios"].get(portfolio_name, {}).get("transactions", [])
+
+
+# ============================================================================
+# AVCO ENGINE  — derives portfolio state from transaction list
+# ============================================================================
+
+def compute_positions(transactions: list[dict]) -> dict[str, dict]:
+    """
+    Given a flat list of BUY/SELL transactions, compute current positions
+    using Average Cost (AVCO) method.
+
+    Returns dict keyed by ticker:
+    {
+      "NVDA": {
+        "ticker": "NVDA",
+        "currency": "USD",
+        "quantity": 53.0,           # shares currently held
+        "avg_cost": 13.43,          # AVCO per share of remaining position
+        "total_cost": 712.79,       # avg_cost × quantity (cost basis of open position)
+        "realized_pl": 1240.50,     # cumulative realized P&L from all sells
+        "transactions": [...]       # all txs for this ticker
+      }
+    }
+    """
+    positions: dict[str, dict] = {}
+
+    for tx in transactions:
+        ticker = tx["ticker"].upper()
+        if ticker not in positions:
+            positions[ticker] = {
+                "ticker": ticker,
+                "currency": tx.get("currency", "USD"),
+                "quantity": 0.0,
+                "avg_cost": 0.0,
+                "total_cost": 0.0,
+                "realized_pl": 0.0,
+                "transactions": [],
+            }
+
+        p = positions[ticker]
+        p["transactions"].append(tx)
+        qty = float(tx["quantity"])
+        price = float(tx["price"])
+
+        if tx["action"] == "BUY":
+            # AVCO: new avg = (old_total_cost + new_cost) / new_total_qty
+            new_total_cost = p["total_cost"] + qty * price
+            new_qty = p["quantity"] + qty
+            p["quantity"] = new_qty
+            p["total_cost"] = new_total_cost
+            p["avg_cost"] = new_total_cost / new_qty if new_qty else 0.0
+
+        elif tx["action"] == "SELL":
+            if qty > p["quantity"] + 1e-9:
+                # Shouldn't happen if UI validates — skip gracefully
+                continue
+            # Realized P&L = (sell price - avg cost) × qty sold
+            p["realized_pl"] += (price - p["avg_cost"]) * qty
+            p["quantity"] -= qty
+            p["total_cost"] = p["avg_cost"] * p["quantity"]
+            if p["quantity"] < 1e-9:
+                p["quantity"] = 0.0
+                p["total_cost"] = 0.0
+                # Keep avg_cost for history display
+
+    return positions
+
+
 def load_portfolio(name: str | None = None) -> list[dict]:
-    """Load holdings for a specific portfolio (or the active one)."""
+    """Legacy helper — returns flat holdings list derived from transactions.
+    Used by the report generator and refresh endpoint."""
     store = load_store()
     name = name or store["active"]
-    return store["portfolios"].get(name, [])
+    txs = store["portfolios"].get(name, {}).get("transactions", [])
+    positions = compute_positions(txs)
+    result = []
+    for p in positions.values():
+        if p["quantity"] > 0:
+            result.append({
+                "ticker": p["ticker"],
+                "quantity": p["quantity"],
+                "avg_price": p["avg_cost"],
+                "currency": p["currency"],
+            })
+    return result
+
+
 
 
 # ============================================================================
@@ -700,7 +850,7 @@ def api_create_portfolio():
     store = load_store()
     if name in store["portfolios"]:
         return jsonify({"error": f"Portfolio '{name}' already exists"}), 409
-    store["portfolios"][name] = []
+    store["portfolios"][name] = {"transactions": []}
     store["active"] = name
     save_store(store)
     return jsonify({"ok": True, "active": name})
@@ -725,20 +875,135 @@ def api_delete_portfolio():
 
 @app.route("/api/portfolio", methods=["GET", "POST"])
 def api_portfolio():
-    """Read or write the currently-active portfolio's holdings."""
+    """Read or write the currently-active portfolio's holdings (legacy compat)."""
     store = load_store()
     active = store["active"]
     if request.method == "POST":
-        holdings = request.get_json()
-        if not isinstance(holdings, list):
-            return jsonify({"error": "Expected a list"}), 400
-        for h in holdings:
-            if not all(k in h for k in ("ticker", "quantity", "avg_price", "currency")):
-                return jsonify({"error": "Missing required fields"}), 400
-        store["portfolios"][active] = holdings
-        save_store(store)
-        return jsonify({"ok": True})
-    return jsonify(store["portfolios"][active])
+        # Accept either a list of holdings (legacy migrate.py) or
+        # a dict with 'transactions' key
+        body = request.get_json()
+        if isinstance(body, list):
+            # Legacy: convert holdings list to BUY transactions
+            txs = []
+            for h in body:
+                if not all(k in h for k in ("ticker", "quantity", "avg_price", "currency")):
+                    return jsonify({"error": "Missing required fields"}), 400
+                txs.append({
+                    "id": _new_id(),
+                    "action": "BUY",
+                    "ticker": h["ticker"].upper(),
+                    "quantity": float(h["quantity"]),
+                    "price": float(h["avg_price"]),
+                    "currency": h["currency"],
+                    "note": "Imported",
+                })
+            store["portfolios"][active] = {"transactions": txs}
+            save_store(store)
+            return jsonify({"ok": True})
+        return jsonify({"error": "Use /api/transactions for v3 operations"}), 400
+
+    # GET: return derived holdings list (for refresh endpoint compatibility)
+    txs = store["portfolios"].get(active, {}).get("transactions", [])
+    positions = compute_positions(txs)
+    result = [
+        {"ticker": p["ticker"], "quantity": p["quantity"],
+         "avg_price": p["avg_cost"], "currency": p["currency"]}
+        for p in positions.values() if p["quantity"] > 0
+    ]
+    return jsonify(result)
+
+
+@app.route("/api/transactions", methods=["GET"])
+def api_get_transactions():
+    """Return all transactions + derived positions for the active portfolio."""
+    store = load_store()
+    active = store["active"]
+    txs = store["portfolios"].get(active, {}).get("transactions", [])
+    positions = compute_positions(txs)
+    return jsonify({
+        "transactions": txs,
+        "positions": list(positions.values()),
+        "portfolio": active,
+    })
+
+
+@app.route("/api/transactions/add", methods=["POST"])
+def api_add_transaction():
+    """Add a BUY or SELL transaction."""
+    store = load_store()
+    active = store["active"]
+    data = request.get_json() or {}
+
+    action = (data.get("action") or "").upper()
+    ticker = (data.get("ticker") or "").upper().strip()
+    try:
+        quantity = float(data.get("quantity", 0))
+        price    = float(data.get("price", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "quantity and price must be numbers"}), 400
+    currency = (data.get("currency") or "USD").upper()
+    note     = (data.get("note") or "").strip()[:200]
+
+    if action not in ("BUY", "SELL"):
+        return jsonify({"error": "action must be BUY or SELL"}), 400
+    if not ticker:
+        return jsonify({"error": "ticker required"}), 400
+    if quantity <= 0:
+        return jsonify({"error": "quantity must be positive"}), 400
+    if price <= 0:
+        return jsonify({"error": "price must be positive"}), 400
+
+    # Validate SELL doesn't exceed held quantity
+    if action == "SELL":
+        txs = store["portfolios"].get(active, {}).get("transactions", [])
+        positions = compute_positions(txs)
+        held = positions.get(ticker, {}).get("quantity", 0)
+        if quantity > held + 1e-9:
+            return jsonify({
+                "error": f"Cannot sell {quantity} — only {held:.4g} shares held"
+            }), 400
+
+    tx = {
+        "id": _new_id(),
+        "action": action,
+        "ticker": ticker,
+        "quantity": quantity,
+        "price": price,
+        "currency": currency,
+        "note": note,
+    }
+    if active not in store["portfolios"]:
+        store["portfolios"][active] = {"transactions": []}
+    store["portfolios"][active]["transactions"].append(tx)
+    save_store(store)
+    return jsonify({"ok": True, "transaction": tx})
+
+
+@app.route("/api/transactions/delete", methods=["POST"])
+def api_delete_transaction():
+    """Delete a transaction by id. Validates resulting state is consistent."""
+    store = load_store()
+    active = store["active"]
+    tx_id = (request.get_json() or {}).get("id")
+    if not tx_id:
+        return jsonify({"error": "id required"}), 400
+
+    txs = store["portfolios"].get(active, {}).get("transactions", [])
+    new_txs = [t for t in txs if t["id"] != tx_id]
+    if len(new_txs) == len(txs):
+        return jsonify({"error": "Transaction not found"}), 404
+
+    # Validate: removing this tx shouldn't result in negative quantities
+    positions = compute_positions(new_txs)
+    for p in positions.values():
+        if p["quantity"] < -1e-9:
+            return jsonify({
+                "error": f"Cannot delete: would result in negative position for {p['ticker']}"
+            }), 400
+
+    store["portfolios"][active]["transactions"] = new_txs
+    save_store(store)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/refresh")
@@ -747,33 +1012,45 @@ def api_refresh():
     display_ccy = request.args.get("display_ccy", "ILS").upper()
     force = request.args.get("force", "0") == "1"
 
-    holdings = load_portfolio()
-    if not holdings:
-        return jsonify({"holdings": [], "fx": {}, "display_ccy": display_ccy})
+    store = load_store()
+    active = store["active"]
+    txs = store["portfolios"].get(active, {}).get("transactions", [])
+    positions = compute_positions(txs)
 
-    # Fetch each unique ticker
-    tickers = list({h["ticker"] for h in holdings})
-    ticker_data = {t: fetch_ticker_data(t, force=force) for t in tickers}
+    # Only fetch tickers with open positions
+    open_positions = {t: p for t, p in positions.items() if p["quantity"] > 0}
+    if not open_positions and not positions:
+        return jsonify({"holdings": [], "fx": {}, "display_ccy": display_ccy,
+                        "realized_pl_total": 0})
 
-    # Determine FX rates needed
-    currencies = {h["currency"] for h in holdings}
-    fx = {}
-    for ccy in currencies:
-        fx[ccy] = fetch_fx(ccy, display_ccy)
+    all_tickers = list({p["ticker"] for p in positions.values()})
+    ticker_data = {t: fetch_ticker_data(t, force=force) for t in all_tickers}
 
-    # Attach holding-specific data
+    # FX rates
+    currencies = {p["currency"] for p in positions.values()}
+    fx = {ccy: fetch_fx(ccy, display_ccy) for ccy in currencies}
+
+    # Build enriched holdings (open positions only)
     enriched = []
-    for h in holdings:
-        td = ticker_data.get(h["ticker"], {})
+    for ticker, p in open_positions.items():
+        td = ticker_data.get(ticker, {})
         enriched.append({
-            **h,
+            "ticker": p["ticker"],
+            "quantity": p["quantity"],
+            "avg_price": p["avg_cost"],
+            "currency": p["currency"],
+            "realized_pl": p["realized_pl"],
             "ticker_data": td,
         })
+
+    # Realized P&L across ALL positions (including fully closed ones)
+    realized_total = sum(p["realized_pl"] for p in positions.values())
 
     return jsonify({
         "holdings": enriched,
         "fx": fx,
         "display_ccy": display_ccy,
+        "realized_pl_total": realized_total,
         "fetched_at": datetime.now().isoformat(timespec="seconds"),
     })
 
@@ -1195,6 +1472,52 @@ INDEX_HTML = r"""<!DOCTYPE html>
     vertical-align: middle;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Page-level tabs (Dashboard / Transactions) */
+  .page-tabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: 32px;
+    border-bottom: 1px solid var(--line);
+  }
+  .page-tab {
+    padding: 10px 24px;
+    font-family: 'Helvetica Neue', sans-serif;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    transition: color 0.15s;
+  }
+  .page-tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+  .page-tab:hover { color: var(--ink); }
+
+  /* Transaction form */
+  .tx-form {
+    display: grid;
+    grid-template-columns: 0.7fr 0.8fr 0.8fr 0.8fr 0.6fr 1.2fr auto;
+    gap: 8px;
+    align-items: end;
+    margin-bottom: 12px;
+  }
+  @media (max-width: 900px) {
+    .tx-form { grid-template-columns: 1fr 1fr 1fr; }
+  }
+
+  /* Transaction history table */
+  .tx-action-buy  { color: var(--pos); font-weight: 700; }
+  .tx-action-sell { color: var(--neg); font-weight: 700; }
+
+  /* 4-card summary grid */
+  .summary { grid-template-columns: repeat(4, 1fr); }
+  @media (max-width: 900px) { .summary { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 500px) { .summary { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -1224,13 +1547,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
 <div id="banner" style="display:none;"></div>
 
+<!-- TAB NAV -->
+<div class="page-tabs">
+  <div class="page-tab active" data-tab="dashboard">Dashboard</div>
+  <div class="page-tab" data-tab="transactions">Transactions</div>
+</div>
+
+<!-- ===================== DASHBOARD TAB ===================== -->
+<div id="tab-dashboard">
+
 <section>
   <div class="label">Snapshot · <span id="active-portfolio-name" style="color: var(--accent);">—</span></div>
   <div class="summary">
     <div class="card">
       <div class="label" style="margin:0 0 6px;">Total Paid</div>
       <div class="big" id="total-paid">—</div>
-      <div class="sub">Cost at purchase</div>
+      <div class="sub">Cost basis (open positions)</div>
     </div>
     <div class="card">
       <div class="label" style="margin:0 0 6px;">Worth Now</div>
@@ -1238,9 +1570,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div class="sub" id="daily-line">—</div>
     </div>
     <div class="card">
-      <div class="label" style="margin:0 0 6px;">Profit / Loss</div>
+      <div class="label" style="margin:0 0 6px;">Unrealized P / L</div>
       <div class="big" id="total-pl">—</div>
       <div class="sub" id="total-pl-pct">—</div>
+    </div>
+    <div class="card">
+      <div class="label" style="margin:0 0 6px;">Realized P / L</div>
+      <div class="big" id="realized-pl">—</div>
+      <div class="sub">From completed sells</div>
     </div>
   </div>
 </section>
@@ -1274,35 +1611,64 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
 <section>
   <h2>Holdings</h2>
-  <div class="add-form">
+  <div id="holdings-area"></div>
+</section>
+
+</div><!-- /tab-dashboard -->
+
+<!-- ===================== TRANSACTIONS TAB ===================== -->
+<div id="tab-transactions" style="display:none;">
+
+<section>
+  <h2>Add Transaction</h2>
+  <div class="tx-form">
+    <div class="field">
+      <label>Action</label>
+      <select id="tx-action">
+        <option value="BUY">BUY</option>
+        <option value="SELL">SELL</option>
+      </select>
+    </div>
     <div class="field">
       <label>Ticker</label>
-      <input type="text" id="f-ticker" placeholder="AAPL or TEVA.TA">
+      <input type="text" id="tx-ticker" placeholder="NVDA">
     </div>
     <div class="field">
       <label>Quantity</label>
-      <input type="number" id="f-qty" step="any" placeholder="10">
+      <input type="number" id="tx-qty" step="any" placeholder="10">
     </div>
     <div class="field">
-      <label>Avg Price (native ccy)</label>
-      <input type="number" id="f-price" step="any" placeholder="150.00">
+      <label>Price per share</label>
+      <input type="number" id="tx-price" step="any" placeholder="130.00">
     </div>
     <div class="field">
       <label>Currency</label>
-      <select id="f-ccy">
+      <select id="tx-ccy">
         <option value="USD">USD</option>
         <option value="ILS">ILS</option>
       </select>
     </div>
-    <button id="add-holding">Add</button>
+    <div class="field">
+      <label>Note (optional)</label>
+      <input type="text" id="tx-note" placeholder="e.g. partial sale">
+    </div>
+    <button id="tx-submit">Add</button>
   </div>
-  <div id="holdings-area"></div>
+  <div id="tx-error" class="notice" style="display:none;"></div>
 </section>
+
+<section>
+  <h2>Transaction History</h2>
+  <div id="tx-area"></div>
+</section>
+
+</div><!-- /tab-transactions -->
 
 <footer>
   Data: Yahoo Finance (yfinance) · Holdings stored in <code>portfolio.json</code> on your machine.<br>
   Snapshot only. Not investment advice. · <a href="/logout" style="color: var(--accent);">Sign out</a>
 </footer>
+
 
 </div>
 
@@ -1311,12 +1677,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
 // STATE
 // ============================================================================
 const state = {
-  portfolios: [],      // list of names
+  portfolios: [],
   activePortfolio: '',
-  holdings: [],        // raw holdings (with ticker_data after refresh)
+  holdings: [],
+  transactions: [],
+  positions: {},         // computed positions from backend
+  realizedPlTotal: 0,
   fx: { USD: 1, ILS: 1 },
   displayCcy: 'ILS',
   chartPeriod: '1w',
+  activeTab: 'dashboard',
 };
 
 // ============================================================================
@@ -1390,11 +1760,23 @@ async function apiCreatePortfolio(name) {
   });
   return { ok: r.ok, ...(await r.json()) };
 }
-async function apiDeletePortfolio(name) {
-  const r = await fetch('/api/portfolios/delete', {
+async function apiGetTransactions() {
+  const r = await fetch('/api/transactions');
+  return r.json();
+}
+async function apiAddTransaction(tx) {
+  const r = await fetch('/api/transactions/add', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify(tx),
+  });
+  return { ok: r.ok, ...(await r.json()) };
+}
+async function apiDeleteTransaction(id) {
+  const r = await fetch('/api/transactions/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id }),
   });
   return { ok: r.ok, ...(await r.json()) };
 }
@@ -1404,12 +1786,29 @@ async function apiDeletePortfolio(name) {
 // ============================================================================
 async function loadInitial() {
   await reloadPortfolioList();
-  const list = await apiGetPortfolio();
-  state.holdings = list.map(h => ({ ...h, ticker_data: null }));
+  await loadTransactions();
   render();
   if (state.holdings.length > 0) {
     await refresh(false);
   }
+}
+
+async function loadTransactions() {
+  const data = await apiGetTransactions();
+  state.transactions = data.transactions || [];
+  state.positions    = {};
+  (data.positions || []).forEach(p => { state.positions[p.ticker] = p; });
+  // Derive holdings list from positions
+  state.holdings = (data.positions || [])
+    .filter(p => p.quantity > 0)
+    .map(p => ({
+      ticker: p.ticker,
+      quantity: p.quantity,
+      avg_price: p.avg_cost,
+      currency: p.currency,
+      realized_pl: p.realized_pl,
+      ticker_data: null,
+    }));
 }
 
 async function reloadPortfolioList() {
@@ -1431,11 +1830,11 @@ async function switchPortfolio(name) {
   await apiSetActive(name);
   state.activePortfolio = name;
   document.getElementById('active-portfolio-name').textContent = name;
-  // Clear stale data and reload
   state.holdings = [];
+  state.transactions = [];
+  state.positions = {};
   render();
-  const list = await apiGetPortfolio();
-  state.holdings = list.map(h => ({ ...h, ticker_data: null }));
+  await loadTransactions();
   render();
   if (state.holdings.length > 0) {
     refresh(false);
@@ -1459,6 +1858,7 @@ async function refresh(force) {
     state.holdings = data.holdings || [];
     state.fx = data.fx || {};
     state.displayCcy = data.display_ccy || state.displayCcy;
+    state.realizedPlTotal = data.realized_pl_total || 0;
 
     const errors = state.holdings
       .map(h => h.ticker_data)
@@ -1492,6 +1892,7 @@ function render() {
   renderHoldings();
   renderMovers();
   renderChart();
+  renderTransactions();
 }
 
 function computeTotals() {
@@ -1536,47 +1937,56 @@ function renderSummary() {
   pl.className = 'big ' + colorClass(t.totalPl);
 
   const plp = document.getElementById('total-pl-pct');
-  plp.textContent = `${fmtPct(t.totalPlPct)} since purchase`;
+  plp.textContent = `${fmtPct(t.totalPlPct)} unrealized`;
   plp.className = 'sub ' + colorClass(t.totalPlPct);
+
+  // Realized P&L card
+  const rpl = document.getElementById('realized-pl');
+  if (rpl) {
+    const realizedDisp = state.realizedPlTotal * (state.fx[state.holdings[0]?.currency] || 1);
+    rpl.textContent = fmtMoney(state.realizedPlTotal, ccy);
+    rpl.className = 'big ' + colorClass(state.realizedPlTotal);
+  }
 }
 
 function renderHoldings() {
   const area = document.getElementById('holdings-area');
   if (state.holdings.length === 0) {
-    area.innerHTML = '<div class="empty">No holdings yet. Add your first position above.</div>';
+    area.innerHTML = '<div class="empty">No open positions. Add a BUY transaction in the Transactions tab.</div>';
     return;
   }
 
-  const rowsHtml = state.holdings.map((h, idx) => {
+  const rowsHtml = state.holdings.map((h) => {
     const td = h.ticker_data;
+    const pos = state.positions[h.ticker] || {};
+    const realizedPl = pos.realized_pl || 0;
+
     if (!td) {
       return `<tr class="row-error">
-        <td><span class="ticker-name">${h.ticker}</span><br><span class="ticker-meta">${h.quantity} @ ${fmtMoney(h.avg_price, h.currency)}</span></td>
-        <td colspan="5">Click Refresh to load price</td>
-        <td><button class="danger" data-remove="${idx}">Remove</button></td>
+        <td><span class="ticker-name">${h.ticker}</span></td>
+        <td colspan="6">Click Refresh to load price</td>
       </tr>`;
     }
     if (td.error) {
       return `<tr class="row-error">
-        <td><span class="ticker-name">${h.ticker}</span><br><span class="ticker-meta">${h.quantity} @ ${fmtMoney(h.avg_price, h.currency)}</span></td>
-        <td colspan="5">${td.error}</td>
-        <td><button class="danger" data-remove="${idx}">Remove</button></td>
+        <td><span class="ticker-name">${h.ticker}</span></td>
+        <td colspan="6">${td.error}</td>
       </tr>`;
     }
     const dailyPct = ((td.current - td.prev) / td.prev) * 100;
-    const value = h.quantity * td.current;
-    const cost  = h.quantity * h.avg_price;
-    const pl    = value - cost;
-    const plPct = cost ? (pl / cost) * 100 : 0;
+    const value    = h.quantity * td.current;
+    const cost     = h.quantity * h.avg_price;
+    const unrealPl = value - cost;
+    const unrealPct = cost ? (unrealPl / cost) * 100 : 0;
     return `<tr>
       <td><span class="ticker-name">${h.ticker}</span></td>
-      <td>${h.quantity}</td>
+      <td>${h.quantity % 1 === 0 ? h.quantity : h.quantity.toFixed(4)}</td>
       <td>${fmtMoney(h.avg_price, h.currency)}</td>
       <td>${fmtMoney(td.current, h.currency)}</td>
       <td class="${colorClass(dailyPct)}">${fmtPct(dailyPct)}</td>
       <td>${fmtMoney(value, h.currency)}</td>
-      <td class="${colorClass(pl)}">${fmtMoney(pl, h.currency)} <span class="${colorClass(plPct)}">(${fmtPct(plPct)})</span></td>
-      <td><button class="danger" data-remove="${idx}">Remove</button></td>
+      <td class="${colorClass(unrealPl)}">${fmtMoney(unrealPl, h.currency)} <span style="font-size:11px;">(${fmtPct(unrealPct)})</span></td>
+      <td class="${colorClass(realizedPl)}">${realizedPl !== 0 ? fmtMoney(realizedPl, h.currency) : '—'}</td>
     </tr>`;
   }).join('');
 
@@ -1590,30 +2000,16 @@ function renderHoldings() {
           <th>Current</th>
           <th>Day %</th>
           <th>Value</th>
-          <th>P / L</th>
-          <th></th>
+          <th>Unrealized P/L</th>
+          <th>Realized P/L</th>
         </tr>
       </thead>
       <tbody>${rowsHtml}</tbody>
     </table>
     <div style="color:var(--muted); font-size:12px; margin-top:8px;">
-      Holdings shown in their native currency. Top totals converted to ${state.displayCcy}.
+      Holdings in native currency · Totals converted to ${state.displayCcy} · AVCO cost basis
     </div>
   `;
-
-  area.querySelectorAll('[data-remove]').forEach(btn => {
-    btn.addEventListener('click', async (e) => {
-      const i = parseInt(e.target.getAttribute('data-remove'), 10);
-      if (confirm(`Remove ${state.holdings[i].ticker}?`)) {
-        state.holdings.splice(i, 1);
-        // Save just the raw fields (not ticker_data)
-        await apiSavePortfolio(state.holdings.map(h => ({
-          ticker: h.ticker, quantity: h.quantity, avg_price: h.avg_price, currency: h.currency
-        })));
-        render();
-      }
-    });
-  });
 }
 
 function renderMovers() {
@@ -1648,6 +2044,69 @@ function renderMovers() {
   document.getElementById('losers').innerHTML =
     losers.length ? losers.map(moverHtml).join('') : '<div class="empty">No data</div>';
 }
+
+function renderTransactions() {
+  const area = document.getElementById('tx-area');
+  if (!area) return;
+
+  if (state.transactions.length === 0) {
+    area.innerHTML = '<div class="empty">No transactions yet. Add a BUY above to get started.</div>';
+    return;
+  }
+
+  // Show in reverse order (newest first)
+  const rows = [...state.transactions].reverse().map(tx => {
+    const actionClass = tx.action === 'BUY' ? 'tx-action-buy' : 'tx-action-sell';
+    const total = tx.quantity * tx.price;
+    return `<tr>
+      <td><span class="${actionClass}">${tx.action}</span></td>
+      <td><b>${tx.ticker}</b></td>
+      <td style="text-align:right;">${tx.quantity % 1 === 0 ? tx.quantity : parseFloat(tx.quantity).toFixed(4)}</td>
+      <td style="text-align:right;">${fmtMoney(tx.price, tx.currency)}</td>
+      <td style="text-align:right;">${fmtMoney(total, tx.currency)}</td>
+      <td style="color:var(--muted); font-size:12px;">${tx.note || ''}</td>
+      <td><button class="danger" data-tx-delete="${tx.id}">✕</button></td>
+    </tr>`;
+  }).join('');
+
+  area.innerHTML = `
+    <table>
+      <thead>
+        <tr>
+          <th>Action</th>
+          <th>Ticker</th>
+          <th style="text-align:right;">Qty</th>
+          <th style="text-align:right;">Price</th>
+          <th style="text-align:right;">Total</th>
+          <th>Note</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div style="color:var(--muted); font-size:12px; margin-top:8px;">
+      ${state.transactions.length} transaction${state.transactions.length !== 1 ? 's' : ''} ·
+      Deleting a transaction recalculates all positions via AVCO.
+    </div>
+  `;
+
+  area.querySelectorAll('[data-tx-delete]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const id = e.target.getAttribute('data-tx-delete');
+      const tx = state.transactions.find(t => t.id === id);
+      if (!tx) return;
+      if (!confirm(`Delete this ${tx.action} of ${tx.quantity} ${tx.ticker}?`)) return;
+      const result = await apiDeleteTransaction(id);
+      if (!result.ok) {
+        alert(result.error || 'Could not delete transaction');
+        return;
+      }
+      await loadTransactions();
+      render();
+    });
+  });
+}
+
 
 function renderChart() {
   const periodDays = { '1w': 7, '1m': 30, '1y': 365 }[state.chartPeriod];
@@ -1814,27 +2273,63 @@ document.getElementById('email-btn').addEventListener('click', async () => {
   }
 });
 
-document.getElementById('add-holding').addEventListener('click', async () => {
-  const t  = document.getElementById('f-ticker').value.trim().toUpperCase();
-  const q  = parseFloat(document.getElementById('f-qty').value);
-  const ap = parseFloat(document.getElementById('f-price').value);
-  const c  = document.getElementById('f-ccy').value;
-  if (!t || !q || !ap) {
-    alert('Please fill in ticker, quantity and avg price.');
+// Transaction form submit
+document.getElementById('tx-submit').addEventListener('click', async () => {
+  const action   = document.getElementById('tx-action').value;
+  const ticker   = document.getElementById('tx-ticker').value.trim().toUpperCase();
+  const qty      = parseFloat(document.getElementById('tx-qty').value);
+  const price    = parseFloat(document.getElementById('tx-price').value);
+  const currency = document.getElementById('tx-ccy').value;
+  const note     = document.getElementById('tx-note').value.trim();
+
+  const errEl = document.getElementById('tx-error');
+  errEl.style.display = 'none';
+
+  if (!ticker || !qty || !price) {
+    errEl.innerHTML = 'Please fill in ticker, quantity and price.';
+    errEl.style.display = 'block';
     return;
   }
-  const newHolding = { ticker: t, quantity: q, avg_price: ap, currency: c };
-  const raw = state.holdings.map(h => ({
-    ticker: h.ticker, quantity: h.quantity, avg_price: h.avg_price, currency: h.currency
-  }));
-  raw.push(newHolding);
-  await apiSavePortfolio(raw);
-  ['f-ticker', 'f-qty', 'f-price'].forEach(id => document.getElementById(id).value = '');
-  state.holdings = raw.map(h => ({ ...h, ticker_data: null }));
+
+  const btn = document.getElementById('tx-submit');
+  btn.disabled = true;
+  btn.textContent = '...';
+
+  const result = await apiAddTransaction({ action, ticker, quantity: qty, price, currency, note });
+
+  btn.disabled = false;
+  btn.textContent = 'Add';
+
+  if (!result.ok) {
+    errEl.innerHTML = `<b>Error:</b> ${result.error || 'Unknown error'}`;
+    errEl.style.display = 'block';
+    return;
+  }
+
+  // Clear form
+  ['tx-ticker', 'tx-qty', 'tx-price', 'tx-note'].forEach(id => {
+    document.getElementById(id).value = '';
+  });
+
+  await loadTransactions();
   render();
-  refresh(false);
+  if (state.holdings.length > 0) refresh(false);
 });
 
+// Page tab switching
+document.querySelectorAll('.page-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.page-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    state.activeTab = tab.dataset.tab;
+    document.getElementById('tab-dashboard').style.display =
+      state.activeTab === 'dashboard' ? '' : 'none';
+    document.getElementById('tab-transactions').style.display =
+      state.activeTab === 'transactions' ? '' : 'none';
+  });
+});
+
+// Chart period tabs
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
