@@ -565,10 +565,14 @@ def require_auth():
         return None
     public_endpoints = {"login", "static"}
     public_paths = {"/login", "/api/health"}
+    # PWA assets must be public — iOS fetches them before auth
+    pwa_paths = {"/manifest.json", "/icon-180.png", "/icon-192.png", "/icon-512.png"}
     # /tasks/* uses its own CRON_SECRET auth
     if request.path.startswith("/tasks/"):
         return None
     if request.endpoint in public_endpoints or request.path in public_paths:
+        return None
+    if request.path in pwa_paths:
         return None
     if not is_authed():
         if request.path.startswith("/api/"):
